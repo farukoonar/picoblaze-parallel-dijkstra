@@ -14,7 +14,7 @@ This project implements a parallel **Dijkstra's Shortest Path Algorithm** on an 
 * `docs/`: Detailed project report and architectural diagrams.
 
 ## Documentation
-For details on the master-slave handshake protocol and instruction flow, please refer to the [Project Report](docs/EHB326E-Final Proje Raporu.pdf).
+For details on the master-slave handshake protocol and instruction flow, please refer to the [Project Report](docs/report.pdf).
 
 ---
 *Developed by Faruk Onar, Hasan Emre Aydemir, and Ozan İnal.*
