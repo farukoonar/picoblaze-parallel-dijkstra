@@ -1,0 +1,18 @@
+# Vivado Generated Files
+*.jou
+*.log
+*.str
+*.dcp
+*.bit
+*.bin
+*.exo
+*.hw/
+*.cache/
+*.runs/
+*.sim/
+*.ip_user_files/
+.Xil/
+.metadata/
+.analytics/
+*.launch
+*.ppl

@@ -1,0 +1,242 @@
+; ==========================================================
+; slave 1 - manager for nodes 0-4
+; ==========================================================
+
+; --- register names ---
+NAMEREG s0, reg_cmd        ; current command from master
+NAMEREG s1, reg_ptr        ; loop counter / pointer
+NAMEREG s2, reg_val_a      ; temporary variable a
+NAMEREG s3, reg_val_b      ; temporary variable b
+NAMEREG s4, global_u       ; current node u (from master)
+NAMEREG s5, global_dist    ; distance of u (from master)
+NAMEREG s6, mem_addr       ; ram address
+NAMEREG s7, min_node       ; nearest node found
+NAMEREG s8, min_dist       ; shortest distance found
+
+; --- port definitions ---
+; buffer ports (communication with master)
+CONSTANT P_CMD,       01   ; read: command
+CONSTANT P_ARG_U,     02   ; read: global u
+CONSTANT P_ARG_DIST,  03   ; read: global dist
+CONSTANT P_STATUS,    04   ; write: status (bit 1 = done)
+CONSTANT P_RES_NODE,  05   ; write: result node
+CONSTANT P_RES_DIST,  06   ; write: result dist
+
+; memory wrapper ports (communication with ram)
+CONSTANT MEM_ADDR_PTR, F0  ; write: set address pointer
+CONSTANT MEM_DATA_WR,  F1  ; write: write data to ram
+CONSTANT MEM_DATA_RD,  F2  ; read: read data from ram
+
+; memory map (base addresses)
+CONSTANT BASE_DIST,    64  ; address 100: distance array
+CONSTANT BASE_VISIT,   6E  ; address 110: visited array
+; note: weight matrix starts at address 0
+
+; commands
+CONSTANT CMD_IDLE,    00
+CONSTANT CMD_INIT,    01
+CONSTANT CMD_FIND,    02
+CONSTANT CMD_RELAX,   03
+
+; ==========================================================
+; main loop (waiting for orders)
+; ==========================================================
+
+idle_loop:
+    ; 1. read the command
+    INPUT reg_cmd, P_CMD
+    
+    ; 2. check what the command is
+    COMPARE reg_cmd, CMD_IDLE
+    JUMP Z, idle_loop        ; if 0, do nothing and wait
+
+    COMPARE reg_cmd, CMD_INIT
+    JUMP Z, do_init          ; go to init task
+
+    COMPARE reg_cmd, CMD_FIND
+    JUMP Z, do_find          ; go to find minimum task
+
+    COMPARE reg_cmd, CMD_RELAX
+    JUMP Z, do_relax         ; go to update neighbors task
+
+    ; if command is unknown, go back to wait
+    JUMP idle_loop
+
+
+; ==========================================================
+; task 1: init (setup)
+; ==========================================================
+do_init:
+    ; reset nodes 0-4
+    LOAD reg_ptr, 00         ; start counter at 0
+
+init_loop:
+    ; --- set distance ---
+    ; address = base_dist + pointer
+    LOAD mem_addr, BASE_DIST
+    ADD mem_addr, reg_ptr
+    OUTPUT mem_addr, MEM_ADDR_PTR
+    
+    ; if node is 0, distance is 0. otherwise infinity (ff).
+    COMPARE reg_ptr, 00
+    JUMP Z, set_zero
+    LOAD reg_val_a, FF       ; infinity
+    JUMP write_dist
+set_zero:
+    LOAD reg_val_a, 00       ; source node
+write_dist:
+    OUTPUT reg_val_a, MEM_DATA_WR
+
+    ; --- set visited ---
+    ; address = base_visit + pointer
+    LOAD mem_addr, BASE_VISIT
+    ADD mem_addr, reg_ptr
+    OUTPUT mem_addr, MEM_ADDR_PTR
+    
+    LOAD reg_val_a, 00       ; not visited yet
+    OUTPUT reg_val_a, MEM_DATA_WR
+
+    ; loop check (do this for nodes 0, 1, 2, 3, 4)
+    ADD reg_ptr, 01
+    COMPARE reg_ptr, 05
+    JUMP NZ, init_loop       ; continue if not reached 5
+
+    JUMP signal_done
+
+
+; ==========================================================
+; task 2: find min (search local minimum)
+; ==========================================================
+do_find:
+    LOAD min_dist, FF        ; start with infinity
+    LOAD min_node, FF        ; default node is none
+    LOAD reg_ptr, 00         ; start searching from node 0
+
+find_loop:
+    ; 1. check if already visited
+    LOAD mem_addr, BASE_VISIT
+    ADD mem_addr, reg_ptr
+    OUTPUT mem_addr, MEM_ADDR_PTR
+    INPUT reg_val_a, MEM_DATA_RD ; read visited status
+    
+    COMPARE reg_val_a, 01        ; is it 1?
+    JUMP Z, skip_node            ; if yes, skip this node
+
+    ; 2. read the distance
+    LOAD mem_addr, BASE_DIST
+    ADD mem_addr, reg_ptr
+    OUTPUT mem_addr, MEM_ADDR_PTR
+    INPUT reg_val_a, MEM_DATA_RD ; read distance
+
+    ; 3. compare: is this distance smaller than what we found so far?
+    COMPARE reg_val_a, min_dist
+    JUMP NC, skip_node           ; if not smaller (no carry), skip
+
+    ; 4. found a new minimum, save it
+    LOAD min_dist, reg_val_a
+    LOAD min_node, reg_ptr
+
+skip_node:
+    ADD reg_ptr, 01
+    COMPARE reg_ptr, 05      ; done with nodes 0-4?
+    JUMP NZ, find_loop
+
+    ; 5. send the best result to master
+    OUTPUT min_node, P_RES_NODE
+    OUTPUT min_dist, P_RES_DIST
+    
+    JUMP signal_done
+
+
+; ==========================================================
+; task 3: relax (update neighbors)
+; ==========================================================
+do_relax:
+    ; get global info from master
+    INPUT global_u, P_ARG_U
+    INPUT global_dist, P_ARG_DIST
+
+    ; --- step a: mark node u as visited if it belongs to me ---
+    COMPARE global_u, 05
+    JUMP NC, start_relax_loop ; if u >= 5, it's not my node. skip marking.
+
+    ; set visited[u] = 1
+    LOAD mem_addr, BASE_VISIT
+    ADD mem_addr, global_u
+    OUTPUT mem_addr, MEM_ADDR_PTR
+    LOAD reg_val_a, 01
+    OUTPUT reg_val_a, MEM_DATA_WR
+
+start_relax_loop:
+    ; check all my nodes (v = 0 to 4) to see if we can update them
+    LOAD reg_ptr, 00          ; v = 0
+
+relax_loop:
+    ; 1. calculate address in weight matrix: (u * 10) + v
+    ; math trick: x10 is same as (x8 + x2)
+    LOAD sA, global_u
+    SL0 sA                    ; x2
+    LOAD sB, sA               ; store 2*u
+    SL0 sA                    ; x4
+    SL0 sA                    ; x8
+    ADD sA, sB                ; 8*u + 2*u = 10*u
+    ADD sA, reg_ptr           ; add v
+    LOAD mem_addr, sA         
+    
+    ; 2. read the weight of the edge
+    OUTPUT mem_addr, MEM_ADDR_PTR
+    INPUT reg_val_a, MEM_DATA_RD  ; weight
+
+    ; 3. does a road exist? (weight is not ff)
+    COMPARE reg_val_a, FF
+    JUMP Z, next_v            ; no road, skip
+
+    ; 4. calculate new distance = global_dist + weight
+    ADD reg_val_a, global_dist
+    JUMP C, next_v            ; if overflow (too big), skip
+    
+    ; 5. read the current distance of node v
+    LOAD mem_addr, BASE_DIST
+    ADD mem_addr, reg_ptr     ; base + v
+    OUTPUT mem_addr, MEM_ADDR_PTR
+    INPUT reg_val_b, MEM_DATA_RD  ; old distance
+
+    ; 6. compare: is new < old?
+    ; logic: calculate (new - old). if new is smaller, it borrows (carry flag = 1).
+    COMPARE reg_val_a, reg_val_b 
+    JUMP C, update_dist           ; if carry set, update it!
+    
+    ; if carry not set (new >= old), don't update
+    JUMP next_v
+
+update_dist:
+    ; 7. write the new, shorter distance to ram
+    ; address pointer is already set from step 5
+    OUTPUT reg_val_a, MEM_DATA_WR
+
+next_v:
+    ADD reg_ptr, 01
+    COMPARE reg_ptr, 05       ; done with nodes 0-4?
+    JUMP NZ, relax_loop
+
+    JUMP signal_done
+
+
+; ==========================================================
+; common finish: signal "done"
+; ==========================================================
+signal_done:
+    ; 1. set done bit (bit 1)
+    LOAD reg_val_a, 02
+    OUTPUT reg_val_a, P_STATUS
+
+wait_ack:
+    ; 2. wait for master to clear the command
+    INPUT reg_cmd, P_CMD
+    COMPARE reg_cmd, 00
+    JUMP NZ, wait_ack
+
+    ; 3. clear status and go back to start
+    LOAD reg_val_a, 00
+    OUTPUT reg_val_a, P_STATUS
+    JUMP idle_loop

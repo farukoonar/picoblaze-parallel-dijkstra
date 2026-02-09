@@ -1,0 +1,147 @@
+; ==========================================================
+; master picoblaze - parallel dijkstra controller
+; ==========================================================
+; task: manage 2 slaves, find global minimum, and store results.
+
+; --- port definitions (slave 1: 0x0*, slave 2: 0x1*) ---
+
+; slave 1 (handles nodes 0-4)
+CONSTANT S1_CMD,      01  ; write: command (1:init, 2:find, 3:relax, 4:report)
+CONSTANT S1_ARG_U,    02  ; write: global u (current node)
+CONSTANT S1_ARG_DIST, 03  ; write: global distance
+CONSTANT S1_STATUS,   04  ; read: status (bit 1 means done)
+CONSTANT S1_RES_NODE, 05  ; read: local min node found by slave
+CONSTANT S1_RES_DIST, 06  ; read: local min distance found by slave
+
+; slave 2 (handles nodes 5-9)
+CONSTANT S2_CMD,      11  ; write: command
+CONSTANT S2_ARG_U,    12  ; write: global u
+CONSTANT S2_ARG_DIST, 13  ; write: global distance
+CONSTANT S2_STATUS,   14  ; read: status
+CONSTANT S2_RES_NODE, 15  ; read: local min node
+CONSTANT S2_RES_DIST, 16  ; read: local min distance
+
+; command codes
+CONSTANT CMD_IDLE,    00
+CONSTANT CMD_INIT,    01
+CONSTANT CMD_FIND,    02
+CONSTANT CMD_RELAX,   03
+CONSTANT CMD_REPORT,  04
+
+; register aliases (renaming registers for clarity)
+; s0 - s9 : final results (distances)
+; sA      : loop counter (10 nodes total)
+; sB      : global min node (u)
+; sC      : global min distance
+; sD      : slave 1 distance
+; sE      : slave 2 distance
+; sF      : temporary / status
+
+; ==========================================================
+; main program
+; ==========================================================
+
+start:
+    ; --- 1. initialization ---
+    LOAD sF, CMD_INIT
+    OUTPUT sF, S1_CMD      ; send init command to slave 1
+    OUTPUT sF, S2_CMD      ; send init command to slave 2
+    CALL wait_slaves       ; wait until both slaves are ready
+
+    ; --- 2. dijkstra loop (10 steps) ---
+    LOAD sA, 0A            ; we have 10 nodes, so loop 10 times
+
+main_loop:
+    
+    ; --- phase a: find global minimum ---
+    LOAD sF, CMD_FIND
+    OUTPUT sF, S1_CMD      ; tell everyone to find their local minimum
+    OUTPUT sF, S2_CMD
+    CALL wait_slaves       ; wait for results
+
+    ; read results
+    INPUT sB, S1_RES_NODE  ; get slave 1 node
+    INPUT sD, S1_RES_DIST  ; get slave 1 distance
+    
+    INPUT sF, S2_RES_NODE  ; get slave 2 node (temp storage)
+    INPUT sE, S2_RES_DIST  ; get slave 2 distance
+
+    ; compare: slave 1 vs slave 2
+    COMPARE sE, sD         ; slave 2 - slave 1
+    JUMP C, s2_smaller     ; if carry set (s2 < s1), jump to s2_smaller
+
+s1_smaller:
+    ; slave 1 found the global minimum
+    LOAD sB, sB            ; node is already in sB
+    LOAD sC, sD            ; copy distance to sC
+    JUMP check_infinity
+
+s2_smaller:
+    ; slave 2 found the global minimum
+    LOAD sB, sF            ; get node from temp storage
+    LOAD sC, sE            ; copy distance to sC
+
+check_infinity:
+    ; if smallest distance is ff (infinity), we can't reach any more nodes
+    COMPARE sC, FF
+    JUMP Z, finish_job
+
+    ; --- phase b: relax edges ---
+    ; broadcast the winner (u, dist) to all slaves
+    
+    ; send to slave 1
+    OUTPUT sB, S1_ARG_U
+    OUTPUT sC, S1_ARG_DIST
+    
+    ; send to slave 2
+    OUTPUT sB, S2_ARG_U
+    OUTPUT sC, S2_ARG_DIST
+    
+    ; tell slaves to update neighbor distances
+    LOAD sF, CMD_RELAX
+    OUTPUT sF, S1_CMD
+    OUTPUT sF, S2_CMD
+    CALL wait_slaves
+
+    ; loop control
+    SUB sA, 01             ; decrease counter
+    JUMP NZ, main_loop     ; if not zero, go back to start
+
+finish_job:
+    ; --- 3. collect results (report) ---
+    
+    ; ask slave 1 to report
+    LOAD sF, CMD_REPORT
+    OUTPUT sF, S1_CMD
+    
+    JUMP infinite_stop
+
+; ==========================================================
+; subroutines (helper functions)
+; ==========================================================
+
+; --- wait_slaves ---
+; waits until both slaves set their status to "done"
+; then resets the command to idle
+wait_slaves:
+    ; 1. wait for slave 1
+wait_s1:
+    INPUT sF, S1_STATUS
+    TEST sF, 02            ; check bit 1 (done flag)
+    JUMP Z, wait_s1        ; if zero (not done), keep waiting
+
+    ; 2. wait for slave 2
+wait_s2:
+    INPUT sF, S2_STATUS
+    TEST sF, 02            ; check bit 1 (done flag)
+    JUMP Z, wait_s2        ; if zero, keep waiting
+
+    ; 3. reset commands (acknowledge)
+    LOAD sF, CMD_IDLE
+    OUTPUT sF, S1_CMD
+    OUTPUT sF, S2_CMD
+    
+    RETURN
+
+infinite_stop:
+    JUMP infinite_stop
